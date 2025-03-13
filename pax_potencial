@@ -1,0 +1,105 @@
+WITH t1 AS
+  (SELECT dt,
+          city_id,
+          uid,
+          COUNT(order_id) AS order_cnt,
+          COUNT(CASE WHEN payment_method IN ('99pay', '99pay_card', 'credit_card') THEN order_id END) AS online_order_cnt,
+          COUNT(CASE WHEN payment_method IN ('99pay', '99pay_card') THEN order_id END) AS balance_order_cnt,
+          COUNT(CASE WHEN product_line = '21096' THEN order_id END) AS moto_order_cnt,
+          COUNT(CASE WHEN product_line = '21096'AND payment_method IN ('99pay', '99pay_card') THEN order_id END) AS moto_balance_order_cnt,
+          COUNT(CASE WHEN product_line IN ('16', '21076', '21137') THEN order_id END) AS 4w_order_cnt,
+          COUNT(CASE WHEN product_line IN ('16', '21076', '21137') THEN order_id END) AS 4w_balance_order_cnt,
+          SUM(payment_amt) AS order_amt,
+          SUM(IF(payment_method LIKE '%99pay%' OR payment_method LIKE '%card%', payment_amt, NULL)) AS 99pay_order_amt,
+          SUM(IF(payment_method LIKE '%99pay%', payment_amt, NULL)) AS balance_order_amt,
+          SUM(IF(product_line = '21096', payment_amt, NULL)) AS moto_amt,
+          SUM(IF(product_line = '21096' AND payment_method LIKE '%99pay%', payment_amt, NULL)) AS balance_moto_amt,
+          SUM(IF(product_line IN ('16', '21076', '21137'), payment_amt, NULL)) as 4w_amt,
+          SUM(IF(product_line IN ('16', '21076', '21137') AND payment_method LIKE '%99pay%', payment_amt, NULL)) as balance_4w_amt
+   FROM fintech_pay.dwd_pay_trd_order_di
+   WHERE 1=1
+     AND country_code = 'BR'
+     AND sku = 'trip'
+     AND dt >= '2025-03-03'
+     AND dt <= '2025-03-09'
+     AND order_status = 4
+   GROUP BY dt,
+            city_id,
+            uid),
+
+kyc AS (
+    SELECT 
+        uid --dt 
+        ,is_primary_kyc
+        ,is_full_kyc,
+        CASE
+            WHEN is_full_kyc = 1 THEN 'full_kyc'
+            WHEN is_primary_kyc = 1 THEN 'simple_kyc'
+            ELSE 'no_kyc'
+        END AS kyc_status
+    FROM fintech_pay.dim_pay_user_passengers_wallet_account_info_df 
+    WHERE dt = date_sub(current_date(),2)
+    AND country_code = 'BR'
+    AND role = 1
+),
+
+pax_potential AS (
+    SELECT  *
+    FROM    (
+        SELECT  passenger_id
+                ,(cast(passenger_id as bigint) | 281474976710656) as uid
+                ,stat_year_month -- faxer joint stat year month com dt
+                ,lifecycle
+                ,row_number() OVER (PARTITION BY passenger_id, stat_year_month ORDER BY finish_4w DESC) rk
+        FROM    (
+            SELECT  passenger_id 
+                    ,weekofyear(concat(substr(pt, 1, 4), '-', substr(pt, 5, 2), '-', substr(pt, 7, 2))) as stat_year_month
+                    ,lifecycle
+                    ,sum(finish_4w) as finish_4w
+            FROM    international_bi.pax_lifecycle_seg_4_wheels
+            WHERE   country_code = 'BR'
+            and   pt between '20250303'
+            and   '20250309'
+        group by passenger_id, weekofyear(concat(substr(pt, 1, 4), '-', substr(pt, 5, 2), '-', substr(pt, 7, 2))), lifecycle
+        ) a
+    ) b
+    WHERE   
+        rk = 1
+)
+
+SELECT 
+    YEAR(t1.dt) AS year_id,
+    weekofyear(t1.dt) AS week_id,
+    t1.city_id,
+    t2.kyc_status,
+    t3.lifecycle,
+    count(distinct case when t1.order_cnt > 0 then t1.uid end) as active_user,
+    sum(t1.order_cnt) as total_txn,
+    count(distinct case when t1.online_order_cnt > 0 then t1.uid end) as online_users,
+    sum(t1.online_order_cnt) as total_online_txn,
+    count(distinct case when t1.balance_order_cnt > 0 then t1.uid end) as balance_users,
+    sum(t1.balance_order_cnt) as total_balance_txn,
+    sum(t1.order_amt) as total_gmv,
+    sum(t1.99pay_order_amt) as online_gmv,
+    sum(t1.balance_order_amt) as balance_gmv,
+    count(distinct case when t1.moto_order_cnt > 0 then t1.uid end) as moto_user,
+    sum(t1.moto_order_cnt) as moto_txn,
+    count(distinct case when t1.moto_balance_order_cnt > 0 then t1.uid end) as balance_moto_user,
+    sum(t1.moto_balance_order_cnt) as balance_moto_txn,
+    sum(t1.moto_amt) as moto_gmv,
+    sum(t1.balance_moto_amt) as balance_moto_gmv,
+    count(distinct case when t1.4w_order_cnt > 0 then t1.uid end) as 4w_user,
+    sum(t1.4w_order_cnt) as 4w_txn,
+    count(distinct case when t1.4w_balance_order_cnt > 0 then t1.uid end) as balance_4w_user,
+    sum(t1.4w_balance_order_cnt) as balance_4w_txn,
+    sum(t1.4w_amt) as 4w_gmv,
+    sum(t1.balance_4w_amt) as balance_4w_gmv
+from t1
+left join kyc t2 on t1.uid = t2.uid
+left join pax_potential t3 on t1.uid = t3.uid
+group by
+    year(t1.dt),
+    weekofyear(t1.dt),
+    t1.city_id,
+    t2.kyc_status,
+    t3.lifecycle;
